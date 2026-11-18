@@ -1,0 +1,10 @@
+{
+  "name": "temporal-custom-maker-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reference client for Temporal's Custom maker port: requests in, signed quotes out, account state and acts for your own risk and margin systems.",
+  "scripts": { "start": "node adapter.mjs", "test": "node selftest.mjs" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "@noble/curves": "1.9.7", "@noble/hashes": "1.8.0" }
+}

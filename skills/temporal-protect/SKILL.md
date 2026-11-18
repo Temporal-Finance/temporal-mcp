@@ -37,6 +37,8 @@ If the `temporal` MCP server is connected, use its tools. Otherwise call the rou
 | Typed data to sign | `temporal_prepare_intent` | nonce + domain |
 | Send | `temporal_submit_intent` | `POST /chain/intent` `{user, call, nonce, deadline, sig, snaps}` |
 
+Making markets (maker accounts, TLP, a Custom maker's port) is a different job: use the `temporal-earn` skill. TLP is the default way to earn; its maker tools need a venue session and `confirmed: true` on every write.
+
 ## Procedure (do not skip steps)
 
 1. **Read.** `temporal_access` for the wallet (open beta: it must accept the terms once, one signature), `temporal_venue_status`, then `temporal_account_state`.

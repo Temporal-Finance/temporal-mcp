@@ -18,12 +18,12 @@ export const BASE = process.env.TEMPORAL_BASE || "https://protect.temporal.excha
 const UA = "temporal-mcp/0.2 (+https://protect.temporal.exchange/llms.txt)";
 
 /** The venue answers a refusal with HTTP 200 and { ok: false, code, reason }, so a call succeeded only when BOTH the status and the body's `ok` say so. */
-export async function api(method, path, { query, body } = {}, ctx = {}) {
+export async function api(method, path, { query, body, token } = {}, ctx = {}) {
   const url = new URL((ctx.base || BASE) + path);
   if (query) for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
   const res = await fetch(url, {
     method,
-    headers: { "user-agent": UA, accept: "application/json", ...(ctx.headers || {}), ...(body ? { "content-type": "application/json" } : {}) },
+    headers: { "user-agent": UA, accept: "application/json", ...(ctx.headers || {}), ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body ? { "content-type": "application/json" } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
@@ -33,6 +33,25 @@ export async function api(method, path, { query, body } = {}, ctx = {}) {
 }
 
 const refuse = (status, code, detail, extra = {}) => ({ ok: false, status, data: { ok: false, code, reason: detail, ...extra } });
+
+// ---- maker routes: a venue session token is passed PER CALL (Authorization: Bearer), never stored, never logged, never echoed back ----
+const token = { type: "string", minLength: 16, maxLength: 256, description: "The venue session token from temporal_session_open. Sent on this call only; never store or print it." };
+const confirmed = { type: "boolean", description: "Must be true: the human approved this exact change after you described it." };
+const notConfirmed = () => refuse(400, "not_confirmed", "Describe the change in plain words, get an explicit yes, then retry with confirmed:true. Nothing was changed.");
+/** A maker WRITE: refused without confirmed:true; sent once, never retried; the venue's refusal is passed through by name. */
+async function makerWrite(a, path, body, ctx) {
+  if (a.confirmed !== true) return notConfirmed();
+  return api("POST", path, { body, token: a.token }, ctx);
+}
+/** temporal_maker_settings without a patch: the account's dials, from the session's own view. */
+async function makerRead(a, ctx) {
+  const s = await api("GET", "/state", { token: a.token }, ctx);
+  if (!s.ok) return s;
+  const accts = Object.entries(s.data?.view?.wallet?.accounts ?? {}).filter(([, x]) => x?.kind === "earn");
+  const pick = accts.filter(([k, x]) => (a.accountKey == null || k === a.accountKey || x.id === a.accountKey) && (a.account == null || String(x.ledgerAccountId) === String(a.account)));
+  return { ok: true, status: 200, data: { accounts: pick.map(([k, x]) => ({ id: x.id ?? k, ledgerAccountId: x.ledgerAccountId, asset: x.asset, quoting: x.quoting, mode: x.mode, curve: x.curve, curves: x.curves })) } };
+}
+
 
 const asset = { type: "string", enum: ["BTC", "HYPE"], description: "Underlying. BTC is open; HYPE is close-only during the beta (open positions can be closed, nothing new opens)." };
 const wallet = { type: "string", pattern: "^0x[0-9a-fA-F]{40}$", description: "The trader's wallet address (public address only, never a key)." };
@@ -221,12 +240,12 @@ export const tools = [
       "Acts and their arguments: connect (none); mintAccount (kind: options | protect | earn); deposit / withdraw (account, usd); " +
       "openLegAtFront (account, asset, side buy|sell, wing, strikeUSD, months, qty, consentUSD = the most cash the open may draw, boundUSD = the price limit per coin: a buy fills at most it, a sell at least it; the venue may require it); " +
       "closeLegAtFront (account, legIndex, qty, moreLegs?); closeAccountAtFront (account); " +
-      "openPerpWithLegs (account, asset, side long|short, qty, leverage, marginUSD, limitUSD?, legs: 1 to 4 of { wing, side, strikeUSD, qty, months, boundUSD, consentUSD }); requestClosePerp (account, perpId). " +
+      "openPerpWithLegs (account, asset, side long|short, qty, leverage, marginUSD, limitUSD?, legs: 1 to 4 of { wing, side, strikeUSD, qty, months, boundUSD, consentUSD }); requestClosePerp (account, perpId); exitMaker (account: an EARN maker leaves: its written options are handed to the other makers at market; refused by name ExitOff while the venue has it off, Underwater below margin). " +
       "`account` is the ledger account id from temporal_account_state; a new wallet connects and mints first. A bad argument is refused by name (bad_arg, with the argument).",
     inputSchema: {
       type: "object",
       properties: {
-        act: { type: "string", enum: ["connect", "mintAccount", "deposit", "withdraw", "openLegAtFront", "closeLegAtFront", "closeAccountAtFront", "openPerpWithLegs", "requestClosePerp"] },
+        act: { type: "string", enum: ["connect", "mintAccount", "deposit", "withdraw", "openLegAtFront", "closeLegAtFront", "closeAccountAtFront", "openPerpWithLegs", "requestClosePerp", "exitMaker"] },
         wallet,
         account: { type: "integer", minimum: 0, description: "Ledger account id (the `id` of an account in temporal_account_state)." },
         kind: { type: "string", enum: ["options", "protect", "earn"], description: "mintAccount: the account kind." },
@@ -355,13 +374,230 @@ export const tools = [
       return api("POST", "/chain/intent", { body }, ctx);
     },
   },
+  // ---- MAKERS: the bearer-session controls. TLP is the default way to earn; Custom is only for a maker who brings its own pricing. ----
+  {
+    name: "temporal_session_prepare",
+    title: "Get the message a maker wallet signs to open a venue session",
+    description:
+      "Use FIRST when an agent must change maker settings (quoting on or off, caps, a covering perp, a custom bot's registration): those routes need a venue session, not a ledger signature. " +
+      "Returns { address, nonce, message }: have the wallet sign `message` with personal_sign (EIP-191; it authorises nothing, moves no funds, costs no gas; the nonce expires in 10 minutes), then call temporal_session_open. Nothing is stored on this server.",
+    inputSchema: { type: "object", properties: { wallet }, required: ["wallet"], additionalProperties: false },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+    run: (a, ctx) => api("POST", "/auth/nonce", { body: { address: a.wallet } }, ctx),
+  },
+  {
+    name: "temporal_session_open",
+    title: "Turn the wallet's signature into a venue session token",
+    description:
+      "Use after the wallet signed the message from temporal_session_prepare. Returns { token, wallet }: the caller keeps the token and passes it as `token` to the maker tools (it is sent as Authorization: Bearer on that one call). " +
+      "This server keeps nothing and logs nothing; never paste the token into chat or a log. The session carries no spending power: money still moves only by wallet-signed acts (temporal_build_call). A bad or expired signature is refused by name.",
+    inputSchema: {
+      type: "object",
+      properties: { wallet, signature: { type: "string", pattern: "^0x[0-9a-fA-F]{130}$", description: "The wallet's personal_sign signature over the exact message temporal_session_prepare returned." } },
+      required: ["wallet", "signature"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    run: async (a, ctx) => {
+      const r = await api("POST", "/auth/verify", { body: { address: a.wallet, signature: a.signature } }, ctx);
+      if (!r.ok) return r;
+      return { ok: true, status: r.status, data: { token: r.data?.token, wallet: r.data?.wallet, next: "Pass `token` to the temporal_maker_* tools. Close it with temporal_session_close when done." } };
+    },
+  },
+  {
+    name: "temporal_session_close",
+    title: "End a venue session",
+    description: "Use when the maker work is finished, or the token may have leaked: revokes that session token at the venue. Changes nothing else.",
+    inputSchema: { type: "object", properties: { token }, required: ["token"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    run: (a, ctx) => api("POST", "/auth/logout", { token: a.token, body: {} }, ctx),
+  },
+  {
+    name: "temporal_maker_state",
+    title: "Read a maker's accounts: quoting state, caps, margin, liquidation distance",
+    description:
+      "Use before any maker change, and on a timer by a custom maker's bot. Returns the signed-in wallet's EARN (maker) accounts as the venue records them (`id` = the record key the other maker tools take as accountKey, `ledgerAccountId`, quoting on or off, mode, curve dials) " +
+      "plus the ledger's own numbers for the wallet from temporal_account_state (equity, margin requirement, distance to liquidation, positions) when you also pass `wallet`. Read-only; the session token is sent on this call only.",
+    inputSchema: { type: "object", properties: { token, wallet: { ...wallet, description: "Optional: also reads the ledger accounts (equity, requirement, liquidation distance, legs, perps)." } }, required: ["token"], additionalProperties: false },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+    run: async (a, ctx) => {
+      const [s, c] = await Promise.all([api("GET", "/state", { token: a.token }, ctx), a.wallet ? api("GET", "/chain/state", { query: { wallet: a.wallet } }, ctx) : Promise.resolve(null)]);
+      if (!s.ok) return s;
+      const accts = s.data?.view?.wallet?.accounts ?? {};
+      const KEEP = ["id", "name", "kind", "asset", "quoting", "mode", "tlp", "closed", "ledgerAccountId", "depositUSD", "withdrawableUSD", "curve", "curves"];
+      const earn = Object.entries(accts).filter(([, x]) => x?.kind === "earn").map(([key, x]) => Object.fromEntries([["id", x.id ?? key], ...KEEP.filter((k) => k !== "id" && x[k] !== undefined).map((k) => [k, x[k]])]));
+      return { ok: true, status: 200, data: { earnAccounts: earn, ledger: c ? (c.ok ? c.data : { refused: true, ...c.data }) : undefined } };
+    },
+  },
+  {
+    name: "temporal_maker_connections",
+    title: "List a maker wallet's registered custom-bot connections",
+    description: "Use to check whether a custom maker's bot is registered and online (poll transport) or to find the connection `id` that temporal_maker_unregister takes. Read-only. Not needed for TLP: the venue runs that program.",
+    inputSchema: { type: "object", properties: { token }, required: ["token"], additionalProperties: false },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+    run: (a, ctx) => api("GET", "/rfq/makers", { token: a.token }, ctx),
+  },
+  {
+    name: "temporal_maker_quoting",
+    title: "Turn a maker account's quoting on or off",
+    description:
+      "Use to start or stop making markets on an EARN account. TLP is the default way to earn (one deposit, the venue quotes for you): quoting on with mode auto and tlp:true. " +
+      "Custom (mode custom) is only for a maker that brings its own pricing and runs its own bot; the venue enforces only the hard limits. Quoting needs a deposit on the account (refused by name: no_deposit) and a mode when the curve is untouched (mode_unconfirmed). " +
+      "Quoting off is always allowed. A maker that leaves must also close its positions (see temporal_build_call: closeLegAtFront, exitMaker, closeAccountAtFront). Moves no money but changes who can trade against the account's margin: describe it to the human and wait for a yes; set confirmed:true.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        token,
+        on: { type: "boolean", description: "true = start quoting, false = stop." },
+        account: { type: "integer", minimum: 0, description: "The ledger account id of the EARN account (temporal_account_state `id`)." },
+        accountKey: { type: "string", description: "Optional: the venue record key from temporal_maker_state `id`." },
+        mode: { type: "string", enum: ["auto", "custom"], description: "auto = the venue quotes the oracle's own bid and ask for you (TLP is auto). custom = your bot quotes (register it with temporal_maker_register)." },
+        tlp: { type: "boolean", description: "true marks the account as a TLP (the one-click market maker across listed assets). Use with mode auto." },
+        asset: { type: "string", enum: ["BTC", "HYPE"], description: "The market the account quotes (default BTC)." },
+        confirmed,
+      },
+      required: ["token", "on", "confirmed"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    run: (a, ctx) => makerWrite(a, "/account/quoting", { id: a.accountKey ?? null, on: a.on, ...(a.mode ? { mode: a.mode } : {}), ...(a.tlp != null ? { tlp: a.tlp } : {}), ...(a.asset ? { asset: a.asset } : {}), ...(a.account != null ? { ledgerAccountId: a.account } : {}) }, ctx),
+  },
+  {
+    name: "temporal_maker_settings",
+    title: "Read or set a TLP / AUTO maker account's caps and spread dials",
+    description:
+      "For TLP and AUTO accounts, where the venue prices for you: use to read or change the caps that bound the account's room and its spread. A CUSTOM maker prices in its own bot and owns its limits there; it normally never needs this (it does need temporal_maker_state). " +
+      "Without `patch` this reads the account's dials. With `patch` it sets them (confirmed:true required): Eplus = the most net long exposure the account may take, in coins, 0 or more; Eminus = the most net short exposure, 0 or less (a patch that breaks these bounds is refused by name and nothing is applied); " +
+      "hBps = half-spread in basis points (0 to 150); preset = track (quote the oracle's own bid and ask, TLP / AUTO) or own (the page-typed custom curve). `raw` (custom curves only) posts a grid; the venue may have it switched off (404).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        token,
+        account: { type: "integer", minimum: 0, description: "Ledger account id of the EARN account." },
+        accountKey: { type: "string", description: "The venue record key (temporal_maker_state `id`); needed to patch an existing account." },
+        asset: { type: "string", enum: ["BTC", "HYPE"] },
+        patch: {
+          type: "object",
+          properties: {
+            Eplus: { type: "number", minimum: 0, description: "Cap on net long exposure, coins." },
+            Eminus: { type: "number", maximum: 0, description: "Cap on net short exposure, coins (negative or 0)." },
+            hBps: { type: "number", minimum: 0, maximum: 150, description: "Half-spread, basis points." },
+            preset: { type: "string", enum: ["track", "own"] },
+          },
+          additionalProperties: false,
+        },
+        raw: { type: "object", description: "Custom curves only: the grid body for /account/curve/raw (slices[]). Optional." },
+        confirmed,
+      },
+      required: ["token"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    run: async (a, ctx) => {
+      if (!a.patch && !a.raw) return makerRead(a, ctx);
+      if (a.raw) return makerWrite(a, "/account/curve/raw", { id: a.accountKey ?? null, ...a.raw }, ctx);
+      const body = a.accountKey != null ? { id: a.accountKey, patch: a.patch } : { id: null, patch: a.patch, ...(a.asset ? { asset: a.asset } : {}), ...(a.account != null ? { ledgerAccountId: a.account } : {}) };
+      return makerWrite(a, "/account/curve", body, ctx);
+    },
+  },
+  {
+    name: "temporal_maker_asset",
+    title: "Quote a second asset on a TLP / AUTO maker account",
+    description:
+      "For TLP and AUTO accounts: use to add BTC or HYPE to the markets one EARN account quotes, with that asset's own Eplus (net long cap, coins, 0 or more) and Eminus (net short cap, 0 or less), or to remove one (remove:true). " +
+      "primary:true moves the account's own asset (refused while it has open legs). Needs the venue record key (temporal_maker_state `id`). Changes what the account's margin stands behind: describe it to the human; set confirmed:true.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        token,
+        accountKey: { type: "string", description: "The venue record key (temporal_maker_state `id`)." },
+        account: { type: "integer", minimum: 0, description: "Ledger account id (optional, resolves the record)." },
+        asset: { type: "string", enum: ["BTC", "HYPE"] },
+        Eplus: { type: "number", minimum: 0 },
+        Eminus: { type: "number", maximum: 0 },
+        remove: { type: "boolean" },
+        primary: { type: "boolean" },
+        confirmed,
+      },
+      required: ["token", "accountKey", "asset", "confirmed"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    run: (a, ctx) => makerWrite(a, "/account/asset", { id: a.accountKey, asset: a.asset, ...(a.Eplus != null ? { Eplus: a.Eplus } : {}), ...(a.Eminus != null ? { Eminus: a.Eminus } : {}), ...(a.remove ? { remove: true } : {}), ...(a.primary ? { primary: true } : {}), ...(a.account != null ? { ledgerAccountId: a.account } : {}) }, ctx),
+  },
+  {
+    name: "temporal_maker_perp",
+    title: "Read or set a maker account's covering perp",
+    description:
+      "Use when a maker's sold options leave it exposed and it wants a Hyperliquid perp to cover them (a long covers sold calls, a short sold puts), or to read what it has asked for. A TLP does this automatically; a CUSTOM maker opts in here and manages it itself. " +
+      "Without `side` this reads the account's asks and covering perps. With `side` it sets the ask: long | short | off, size in coins (capped at the coins sold on that side; 'off' withdraws it). The venue places it on the keeper's next pass; it changes at most once per 15 minutes per account. " +
+      "Refusals by name: below_min (smaller than the venue's minimum notional), deposit_short (the margin to reserve is not free), too_soon. The perp's margin is reserved from the account's deposit. Describe the change and wait for a yes; confirmed:true on a set.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        token,
+        account: { type: "integer", minimum: 0, description: "Ledger account id of the EARN account." },
+        asset,
+        side: { type: "string", enum: ["long", "short", "off"], description: "Omit to read." },
+        size: { type: "number", minimum: 0, description: "Coins. 0 withdraws the ask." },
+        confirmed,
+      },
+      required: ["token", "account"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    run: (a, ctx) => {
+      if (a.side == null) return api("GET", "/account/makerPerp", { query: { id: a.account }, token: a.token }, ctx);
+      if (!a.asset) return refuse(400, "bad_arg", "asset is required to set a covering perp.");
+      return makerWrite(a, "/account/makerPerp", { id: a.account, asset: a.asset, side: a.side, size: a.side === "off" ? 0 : a.size ?? 0 }, ctx);
+    },
+  },
+  {
+    name: "temporal_maker_rename",
+    title: "Rename a maker account",
+    description: "Use when a human asks to label an EARN account (up to 40 characters). Cosmetic; no money, no quoting change. Set confirmed:true after the human asked for the name.",
+    inputSchema: { type: "object", properties: { token, accountKey: { type: "string", description: "The venue record key (temporal_maker_state `id`)." }, name: { type: "string", minLength: 1, maxLength: 40 }, confirmed }, required: ["token", "accountKey", "name", "confirmed"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    run: (a, ctx) => makerWrite(a, "/account/rename", { id: a.accountKey, name: a.name }, ctx),
+  },
+  {
+    name: "temporal_maker_register",
+    title: "Register a custom maker's quoting bot with the venue",
+    description:
+      "ONLY for a CUSTOM maker that brings its own pricing (TLP needs no bot: use temporal_maker_quoting). Registers the bot that answers the venue's broadcast requests with signed firm quotes. " +
+      "transport poll (default; the bot long-polls, no inbound port) or webhook (an https url the venue POSTs each request to). One EARN account per wallet. The wallet must own the account, or the bot's signing key must be set as the account's quote signer on chain (signer_not_set otherwise). " +
+      "Re-registering replaces the connection. A reference bot: examples/custom-maker. Describe it to the human; set confirmed:true.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        token,
+        account: { type: "integer", minimum: 0, description: "The ledger account id of the maker's single EARN account." },
+        transport: { type: "string", enum: ["poll", "webhook"], default: "poll" },
+        url: { type: "string", description: "webhook only: the https:// URL the venue POSTs each request to." },
+        signer: { ...wallet, description: "Optional: the bot's quote-signing address when it is not the owner wallet." },
+        confirmed,
+      },
+      required: ["token", "account", "confirmed"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    run: (a, ctx) => makerWrite(a, "/rfq/maker/register", { accounts: [String(a.account)], transport: a.transport ?? "poll", ...(a.url ? { url: a.url } : {}), ...(a.signer ? { signer: a.signer } : {}) }, ctx),
+  },
+  {
+    name: "temporal_maker_unregister",
+    title: "Remove a custom maker bot's registration",
+    description: "Use when a custom maker's bot should stop being asked for quotes (a stop rule fired, or the maker is leaving). The id is from temporal_maker_connections. The account keeps its positions and margin: turn quoting off and close or exit separately. Set confirmed:true.",
+    inputSchema: { type: "object", properties: { token, id: { type: "string", description: "The connection id from temporal_maker_connections." }, confirmed }, required: ["token", "id", "confirmed"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    run: (a, ctx) => makerWrite(a, "/rfq/maker/unregister", { id: a.id }, ctx),
+  },
 ];
 
 export const INSTRUCTIONS = `Temporal (temporal.exchange) is a venue for perpetual options on BTC and HYPE, settled in USDC on Hyperliquid mainnet.
 Two things agents use it for:
 1) Protect: keep a leveraged Hyperliquid perp's exposure but push its liquidation price away, using attached non-expiring options whose premiums roughly offset. Start with temporal_protect_plan.
 2) Options without expiry: buy or sell calls/puts that never expire; holders pay a continuous holding cost (funding for options) instead of rolling. Sellers can back a sold option with a perp instead of cash. Start with temporal_option_quote.
-Yield: idle USDC or an existing perp can earn by making markets (TLP). Start with temporal_earn_plan.
+Yield: idle USDC or an existing perp can earn by making markets. TLP is THE DEFAULT way: one deposit, the venue quotes and manages for you (temporal_earn_plan, then temporal_maker_quoting with mode auto and tlp:true). Custom is only for a maker who brings its own pricing: it is the PORT a maker's existing setup plugs into (requests in, signed quotes out; account state and acts for its own risk and margin systems). The venue enforces only the hard limits: the price limit around the oracle, margin and liquidation, open-interest caps, and the maker's room. Maker settings need a venue session: temporal_session_prepare, the wallet signs, temporal_session_open; pass the token per call and never print it. Every maker write needs confirmed:true after the human said yes. Reference adapter: examples/custom-maker.
 Access: Temporal is an open beta ($100 per wallet): any wallet outside the blocked countries can trade after accepting the terms once (one signature, no gas: POST /terms/accept; GET /launch/gate?wallet= returns the exact text to sign). Call temporal_access for the wallet first; if canTrade is false, tell the human what it says and do not try acts.
 Flow for every act: read state (temporal_account_state) -> temporal_build_call -> temporal_dryrun -> state outcome and cost in plain words and wait for an explicit yes -> temporal_prepare_intent -> the human's wallet signs -> temporal_submit_intent (confirmed:true) -> temporal_fills to confirm.
 Rules: the human's wallet signs every act; never ask for a private key. Named refusals change nothing: report them and do not retry with different numbers unless asked.

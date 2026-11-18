@@ -17,6 +17,7 @@ MCP server for [Temporal](https://temporal.exchange): protect Hyperliquid perps 
 | `temporal_protect_plan` | Opening or holding a leveraged perp and liquidation risk matters |
 | `temporal_option_quote` / `temporal_option_optimise` | You want a call or put with no expiry to manage |
 | `temporal_earn_plan` | Idle USDC, or a perp to earn on, by making option markets |
+| `temporal_session_*` / `temporal_maker_*` | Maker controls: sign in, quoting on/off, TLP settings, covering perp, custom bot register/unregister |
 | `temporal_access` / `temporal_account_state` / `temporal_venue_status` / `temporal_fills` / `temporal_funding_info` | Reads |
 | `temporal_build_call` → `temporal_dryrun` → `temporal_prepare_intent` → `temporal_submit_intent` | Acting: the venue builds the call, you see the outcome and cost, the human says yes, the wallet signs |
 
@@ -26,6 +27,10 @@ MCP server for [Temporal](https://temporal.exchange): protect Hyperliquid perps 
 - `temporal_submit_intent` refuses without `confirmed: true` (the human approved this exact act after a dry run).
 - Named refusals pass through unchanged and are never retried.
 - The call hash is recomputed locally and checked against the call.
+
+## Makers
+
+TLP is the default way to earn: one deposit, the venue quotes and manages for you. Custom is the port a maker's existing pricing, limits and margin systems plug into: `examples/custom-maker` is a reference client with four empty hooks (`price`, `withinLimits`, `shouldQuote`, `manageMargin`). Maker controls (session, quoting on/off, settings, covering perp, register/unregister, exit) are tools too: see `skills/temporal-earn`.
 
 ## Skills
 

@@ -20,6 +20,13 @@ const mock = http.createServer(async (req, res) => {
   if (p === "/access") return j(200, { ok: true, wallet: u.searchParams.get("wallet"), inviteOnly: false, invited: true, termsAccepted: false, canTrade: false });
   if (p === "/perp/plan") return j(200, { ok: true, plan: { floorAfterUSD: 64000, daysProtected: 51 } });
   if (p === "/chain/quote") return j(200, { ok: false, code: "no_single_maker", qty: 2, maxRoom: 0.5, reason: "no single maker" }); // a refusal is HTTP 200
+  if (p === "/auth/nonce") return j(200, { ok: true, address: U, nonce: "n1", message: "Temporal perp-options RFQ — sign in\n\nWallet: " + U, issuedAt: "t" });
+  if (p === "/auth/verify") return j(200, { ok: true, token: "tok_" + "a1".repeat(16), wallet: U, view: { big: true } });
+  if (p === "/auth/logout") return j(200, { ok: true });
+  if (p === "/state") return j(200, { ok: true, view: { wallet: { accounts: { "E1~9": { id: "E1~9", kind: "earn", asset: "BTC", quoting: false, ledgerAccountId: "9", curve: { Eplus: 10 } }, T1: { id: "T1", kind: "trade" } } } } });
+  if (p === "/account/quoting" || p === "/account/curve" || p === "/account/asset" || p === "/account/rename" || p === "/rfq/maker/register" || p === "/rfq/maker/unregister") return j(200, { ok: true, route: p });
+  if (p === "/account/makerPerp") return j(200, req.method === "GET" ? { ok: true, id: 9, requests: {}, perps: [] } : { ok: false, code: "below_min", reason: "A covering perp is at least $20" });
+  if (p === "/rfq/makers") return j(200, { ok: true, makers: [{ id: "abc_9", transport: "poll", accounts: ["9"], online: true }] });
   if (p === "/chain/build") return j(200, { ok: true, act: "connect", call: CALL, callHash: callHashOf(CALL) });
   if (p === "/chain/intent") return j(200, { ok: true, hash: "0xtx" });
   j(404, { error: "nope" });
@@ -87,6 +94,48 @@ const sent = seen.filter((s) => s.path === "/chain/intent").at(-1).body;
 assert.equal("confirmed" in sent, false);
 assert.deepEqual(sent.snaps, ["0xs1"]);
 
+// ---- maker tools: the token rides as Authorization: Bearer on that call only; every write refuses without confirmed:true; refusals pass through ----
+const TOK = "tok_" + "a1".repeat(16);
+assert.ok(list.length >= 25);
+const pre = await call("temporal_session_prepare", { wallet: U });
+assert.match(pre.structuredContent.message, /sign in/);
+assert.deepEqual(seen.filter((s) => s.path === "/auth/nonce").at(-1).body, { address: U });
+const open = await call("temporal_session_open", { wallet: U, signature: SIG });
+assert.equal(open.structuredContent.token, TOK);
+assert.equal("view" in open.structuredContent, false, "the session view is not forwarded");
+const writes = [
+  ["temporal_maker_quoting", { token: TOK, on: true, mode: "auto", tlp: true, account: 9 }, "/account/quoting"],
+  ["temporal_maker_settings", { token: TOK, accountKey: "E1~9", patch: { Eplus: 5 } }, "/account/curve"],
+  ["temporal_maker_asset", { token: TOK, accountKey: "E1~9", asset: "HYPE", Eplus: 5, Eminus: -5 }, "/account/asset"],
+  ["temporal_maker_rename", { token: TOK, accountKey: "E1~9", name: "mine" }, "/account/rename"],
+  ["temporal_maker_register", { token: TOK, account: 9 }, "/rfq/maker/register"],
+  ["temporal_maker_unregister", { token: TOK, id: "abc_9" }, "/rfq/maker/unregister"],
+  ["temporal_maker_perp", { token: TOK, account: 9, asset: "BTC", side: "long", size: 0.01 }, "/account/makerPerp"],
+];
+for (const [name, args, path] of writes) {
+  const n0 = seen.length;
+  const refused = await call(name, args);
+  assert.equal(refused.isError, true, name);
+  assert.ok(refused.structuredContent?.code === "not_confirmed" || /Missing required: .*confirmed/.test(refused.content[0].text), name);
+  assert.equal((await call(name, { ...args, confirmed: false })).structuredContent.code, "not_confirmed", name);
+  assert.equal(seen.length, n0, `${name} must not reach the venue unconfirmed`);
+  const ok = await call(name, { ...args, confirmed: true });
+  const hit = seen.filter((s) => s.path === path && s.method === "POST").at(-1);
+  assert.ok(hit, name);
+  assert.equal(hit.headers.authorization, `Bearer ${TOK}`, name);
+  assert.equal("confirmed" in hit.body || "token" in hit.body, false, `${name}: flag and token are not in the body`);
+  assert.equal(JSON.stringify(ok).includes(TOK), false, `${name}: the token is never echoed`);
+}
+assert.deepEqual(seen.filter((s) => s.path === "/account/quoting").at(-1).body, { id: null, on: true, mode: "auto", tlp: true, ledgerAccountId: 9 });
+const mp = await call("temporal_maker_perp", { token: TOK, account: 9, asset: "BTC", side: "long", size: 0.0001, confirmed: true });
+assert.equal(mp.structuredContent.code, "below_min", "the venue's refusal passes through by name");
+assert.equal((await call("temporal_maker_perp", { token: TOK, account: 9 })).structuredContent.id, 9);
+const ms = await call("temporal_maker_state", { token: TOK });
+assert.deepEqual(ms.structuredContent.earnAccounts.map((x) => x.id), ["E1~9"]);
+assert.equal((await call("temporal_maker_connections", { token: TOK })).structuredContent.makers[0].online, true);
+assert.equal((await call("temporal_maker_settings", { token: TOK })).structuredContent.accounts[0].ledgerAccountId, "9");
+assert.equal((await call("temporal_session_close", { token: TOK })).isError, false);
+assert.equal((await call("temporal_maker_quoting", { on: true, confirmed: true })).isError, true, "a token is required");
 assert.equal((await rpc("nope/nope", {})).error.code, -32601);
 assert.equal((await fetch(MCP)).status, 405);
 assert.equal((await (await fetch(MCP.replace("/mcp", "/.well-known/mcp.json"))).json()).remotes[0].type, "streamable-http");

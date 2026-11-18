@@ -3,7 +3,7 @@
   "name": "exchange.temporal/temporal",
   "title": "Temporal: Hyperliquid liquidation protection & perpetual options",
   "description": "Protect Hyperliquid perps from liquidation and trade perpetual (non-expiring) options. Keyless.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "websiteUrl": "https://temporal.exchange",
   "remotes": [
     {
