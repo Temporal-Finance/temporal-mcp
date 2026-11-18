@@ -1,0 +1,41 @@
+{
+  "name": "@temporal-exchange/mcp",
+  "version": "0.2.0",
+  "description": "MCP server for Temporal: protect Hyperliquid perps from liquidation, trade perpetual (non-expiring) options, earn by making markets. Holds no keys.",
+  "type": "module",
+  "bin": {
+    "temporal-mcp": "src/server.mjs"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "server.json"
+  ],
+  "scripts": {
+    "start": "node src/server.mjs",
+    "stdio": "node src/server.mjs --stdio",
+    "test": "node test/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "hyperliquid",
+    "perps",
+    "options",
+    "liquidation",
+    "hedging",
+    "defi",
+    "ai-agent",
+    "trading"
+  ],
+  "mcpName": "exchange.temporal/temporal",
+  "license": "MIT",
+  "homepage": "https://temporal.exchange",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Temporal-Finance/temporal-mcp"
+  }
+}
